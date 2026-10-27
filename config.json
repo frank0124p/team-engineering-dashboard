@@ -1,0 +1,52 @@
+{
+  "_comment": "團隊產出儀表板設定。source=mock 為雛形示範資料；拿到公司權限後改成 azdo。",
+  "source": "mock",
+
+  "azdo": {
+    "organization": "YOUR_ORG",
+    "project": "YOUR_PROJECT",
+    "repos": [],
+    "pat_env": "AZDO_PAT",
+    "pat_keychain_service": "azdo-pat",
+    "api_version": "7.1",
+    "deployment_pipelines": [],
+    "production_environments": ["Production", "prod"]
+  },
+
+  "window_days": 28,
+  "baseline_days": 28,
+
+  "team": {
+    "name": "Platform Team",
+    "exclude_bots": true,
+    "bot_patterns": ["bot", "[bot]", "service account", "azure pipelines", "dependabot", "renovate"]
+  },
+
+  "ai_detection": {
+    "mode": "commit_trailer",
+    "trailers": [
+      {"tool": "Claude Code", "pattern": "(?i)co-authored-by:\\s*claude"},
+      {"tool": "GitHub Copilot", "pattern": "(?i)co-authored-by:\\s*copilot"},
+      {"tool": "Cursor", "pattern": "(?i)co-authored-by:\\s*cursor"},
+      {"tool": "Codex", "pattern": "(?i)co-authored-by:.*codex"},
+      {"tool": "Gemini", "pattern": "(?i)co-authored-by:\\s*gemini"},
+      {"tool": "Generic", "pattern": "(?i)generated with \\[?(claude code|codex|copilot)"}
+    ],
+    "pr_labels": ["ai-assisted", "ai"]
+  },
+
+  "thresholds": {
+    "pr_size_healthy_lines": 400,
+    "pickup_time_target_hours": 24,
+    "review_time_target_hours": 24,
+    "cycle_time_target_hours": 72,
+    "stale_pr_days": 7,
+    "review_coverage_target_pct": 90
+  },
+
+  "output": {
+    "html_path": "out/team-dashboard.html",
+    "json_path": "out/metrics.json",
+    "discord_channel_id": ""
+  }
+}
