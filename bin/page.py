@@ -2,6 +2,7 @@
 """把指標組裝成完整頁面。standalone=True 產生本機可開的 HTML；
 False 則產生 Artifact 用的 body 片段（不含 html/head/body 標籤）。"""
 import metrics
+import ai_section
 from render import (esc, fmt_h, fmt_num, delta_html, legend, table, details_table,
                     chart_weekly_stack, chart_breakdown, chart_hist, chart_line, chart_hbars)
 
@@ -185,7 +186,7 @@ def _sec(eyebrow, title, note=""):
             f'<h2>{esc(title)}</h2>{n}</div>')
 
 
-def build(m, standalone=True):
+def build(m, standalone=True, insight=None):
     cur, base, d, wk = m["current"], m["baseline"], m["deltas"], m["weekly"]
     dora, flow, ai = cur["dora"], cur["flow"], cur["ai"]
     th = m["meta"]["thresholds"]
@@ -378,6 +379,10 @@ def build(m, standalone=True):
              + chart_hbars([{"type": w["type"], "pct": w["pct"]} for w in flow["work_mix"]], "type", "pct", "%")
              + '</div></section>')
 
+    # ---- AI 品質評估 ----
+    if insight:
+        P.append(ai_section.build(insight, m))
+
     # ---- 成員 ----
     P.append(_sec("People", "成員視圖",
                   "每一列都同時列出吞吐與護欄欄位。用途是找出「誰需要幫忙」，不是排名。"))
@@ -440,9 +445,9 @@ def build(m, standalone=True):
     page_body = "\n".join(P)
 
     if not standalone:
-        return (f'<title>{esc(title)}</title>\n{FONTS}\n<style>{CSS}</style>\n'
+        return (f'<title>{esc(title)}</title>\n{FONTS}\n<style>{CSS}{ai_section.CSS}</style>\n'
                 f'{page_body}\n<script>{JS}</script>')
     return ('<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<title>{esc(title)}</title>{FONTS}'
-            f'<style>{CSS}</style></head><body>{page_body}<script>{JS}</script></body></html>')
+            f'<style>{CSS}{ai_section.CSS}</style></head><body>{page_body}<script>{JS}</script></body></html>')

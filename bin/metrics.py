@@ -379,7 +379,9 @@ def compute(data, cfg):
             "team": cfg["team"]["name"],
             "window_days": wd,
             "thresholds": cfg["thresholds"],
-            "roster_report": roster_of(cfg).report(),
+            # 來源層若自己做過名單過濾（azdo_source 會），它的報告才看得到「名單外還有誰」，
+            # 因為被濾掉的 PR 根本不會進到這裡
+            "roster_report": data.get("roster_report") or roster_of(cfg).report(),
         },
         "current": cur,
         "baseline": base,

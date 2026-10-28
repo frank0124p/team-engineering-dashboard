@@ -90,9 +90,12 @@ def fetch(cfg, now=None):
                 merged, status = None, "active"
 
             n_commits = max(1, int(abs(rnd.gauss(4 if ai else 3, 2))))
+            subject = rnd.choice(SUBJECTS)
+            pr_title = rnd.choice(TITLES).format(subject)
             commits = []
             for c in range(n_commits):
-                msg = rnd.choice(TITLES).format(rnd.choice(SUBJECTS))
+                # commit 訊息要跟 PR 標題同一個主題，否則看起來像資料對應錯誤
+                msg = (pr_title if c == 0 else rnd.choice(TITLES).format(subject))
                 if ai and c == 0:
                     msg += f"\n\n🤖 Generated with {tool}\n\nCo-Authored-By: {tool} <noreply@example.com>"
                 commits.append({
@@ -106,7 +109,7 @@ def fetch(cfg, now=None):
             prs.append({
                 "id": pid_num,
                 "repo": repo,
-                "title": rnd.choice(TITLES).format(rnd.choice(SUBJECTS)),
+                "title": pr_title,
                 "author": pid,
                 "author_name": name,
                 "team": team,

@@ -79,5 +79,16 @@
   "output": {
     "html_path": "out/team-dashboard.html",
     "json_path": "out/metrics.json"
+  },
+  "ai_insight": {
+    "//": "AI 程式碼品質洞察。用本機 Claude Code 逐個 PR 評估，結果是對話素材，不是績效分數。",
+    "enabled": true,
+    "cli": "claude",
+    "model": "sonnet",
+    "min_samples": 5,
+    "//min_samples": "少於這個 PR 數的人不給分，只標資料不足 —— 3 個 PR 的中位數是雜訊",
+    "//repo_paths": "有本機 clone 就能讀到真 diff，證據強度差一個量級：{\"repo-name\": \"/path/to/clone\"}",
+    "repo_paths": {},
+    "max_diff_chars": 60000
   }
 }

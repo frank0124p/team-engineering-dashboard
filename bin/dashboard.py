@@ -174,6 +174,8 @@ def main():
                     help="預設 auto：有 PAT 走 azdo，沒有就示範資料")
     ap.add_argument("--window", type=int)
     ap.add_argument("--out")
+    ap.add_argument("--ai", action="store_true",
+                    help="跑 AI 品質評估並併進儀表板（會呼叫 Claude CLI，需要時間與費用）")
     ap.add_argument("--artifact", action="store_true", help="另外輸出 Artifact 用的 body 片段")
     ap.add_argument("--summary", action="store_true", help="印出純文字摘要")
     ap.add_argument("--quiet", action="store_true")
@@ -200,14 +202,28 @@ def main():
     json_path = os.path.join(ROOT, cfg["output"]["json_path"])
     os.makedirs(os.path.dirname(html_path), exist_ok=True)
 
+    ai = None
+    ai_path = os.path.join(ROOT, "out", "ai_insight.json")
+    if a.ai:
+        import ai_insight
+        print("🤖 執行 AI 品質評估…", file=sys.stderr)
+        ai = ai_insight.run(cfg, m, data)
+        json.dump(ai, open(ai_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    elif os.path.exists(ai_path):
+        # 沒帶 --ai 時沿用上次的結果，並在頁面標明產生時間
+        try:
+            ai = json.load(open(ai_path, encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            ai = None
+
     with open(html_path, "w", encoding="utf-8") as f:
-        f.write(build(m, standalone=True))
+        f.write(build(m, standalone=True, insight=ai))
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(m, f, ensure_ascii=False, indent=2)
     if a.artifact:
         frag = os.path.join(ROOT, "out", "artifact-body.html")
         with open(frag, "w", encoding="utf-8") as f:
-            f.write(build(m, standalone=False))
+            f.write(build(m, standalone=False, insight=ai))
 
     if a.summary:
         print(text_summary(m))
