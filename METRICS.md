@@ -619,14 +619,49 @@ Azure DevOps 的 PR API 不給 additions/deletions，所以預設單位改成**�
 
 ## 9. AI 產出品質評估（AI Insight）
 
-由 Claude 逐人閱讀該期間的 PR 後產生，輸出在 `out/ai_insight.json`，
+由本機的 Claude Code CLI 讀 PR 後產生，輸出在 `out/ai_insight.json`，
 並併入儀表板的「產出品質評估」區塊。
 
 ```bash
-/usr/bin/python3 bin/ai_insight.py            # 全員
+/usr/bin/python3 bin/ai_insight.py                  # 全員
 /usr/bin/python3 bin/ai_insight.py --only "Amy Chen"
-/usr/bin/python3 bin/dashboard.py --ai        # 評估 + 重建儀表板
+/usr/bin/python3 bin/ai_insight.py --pr-limit 4     # 每人最多逐個讀 4 個 PR（控成本）
+/usr/bin/python3 bin/ai_insight.py --no-diff        # 不讀本機 diff（便宜，但評不出程式碼品質）
+/usr/bin/python3 bin/dashboard.py --ai              # 評估 + 重建儀表板
 ```
+
+**評估分兩個階段，這個設計不是為了複雜，是因為單階段評不出程式碼品質。**
+
+```
+階段 1  逐個 PR 讀 → code_quality / change_design / testing / reliability
+        本機有該 repo 的 clone 時讀真 diff（evidence_level=diff）
+        沒有 clone 就只有檔名與 commit 訊息（evidence_level=metadata）
+階段 2  把階段 1 的逐 PR 結論餵給模型做人層級整合
+        → review_craft / impact、摘要、優點、待改進、1-on-1 建議
+```
+
+程式碼相關的四個面向，**分數取階段 1 的中位數**，不是模型在人層級憑印象給的 ——
+每個分數都能往下追到是哪幾個 PR 讀出來的（`people[].pr_level.prs`）。
+
+**實測過的差異**（同一個人、同一段期間）：
+
+| 模式 | 結果 |
+|---|---|
+| 只有 metadata | 六個面向有三個被作廢（程式碼品質、測試落實、審查貢獻），涵蓋率 45% |
+| 有真 diff | 四個程式碼面向全部評得出來，且模型能指出具體問題（例：「同一個 PR 放進兩支功能重疊的模組」） |
+
+所以 **`ai_insight.repo_paths` 是這個功能的關鍵設定**：
+
+```json
+"ai_insight": {
+  "repo_paths": {"core-api": "/Users/you/work/core-api"},
+  "pr_limit": 8,
+  "min_samples": 5
+}
+```
+
+沒設它也能跑，但要知道你拿到的是「只看得到 PR 外觀」的評估 ——
+終端輸出與 JSON 的 `evidence_mix` 會把這件事標出來。
 
 ### 9.1 評分面向與權重
 
@@ -677,8 +712,15 @@ Azure DevOps 的 PR API 不給 additions/deletions，所以預設單位改成**�
 | < 50% | 資料太少，這個總分不該被單獨引用 |
 
 涵蓋率低幾乎都是**資料深度不夠**，不是那個人表現不好。
-常見原因：沒有 diff（評不了可讀性）、沒有測試檔清單（評不了測試）、
-reviews_given 只有總數沒有明細（評不了審查貢獻）。
+最常見的原因就是**沒有 clone 所以讀不到 diff** —— 設好 `ai_insight.repo_paths`
+通常就能把涵蓋率從 45% 拉到 85% 以上。
+
+JSON 裡另外有兩個欄位可以判斷可信度：
+
+| 欄位 | 看什麼 |
+|---|---|
+| `people[].pr_level.evidence_mix` | `{"diff": 6}` 代表六個 PR 都讀到真 diff；`{"metadata": 6}` 代表全是外觀判斷 |
+| `people[].pr_level.prompt_version` | 換過 prompt 或模型之後，新舊分數不能直接比 |
 
 ### 9.4 它看不到什麼
 
@@ -705,6 +747,12 @@ reviews_given 只有總數沒有明細（評不了審查貢獻）。
 
 ### 9.6 成本與快取
 
-每人每次評估約呼叫一次 Claude，費用依模型而定。
-相同的證據包會命中 `out/.ai_cache` 不重複呼叫；
-資料有變動（有新 PR）時雜湊會變，自動重跑。`--no-cache` 可強制重算。
+每人的成本是 **`pr_limit` 次（階段 1，逐 PR）+ 1 次（階段 2，人層級）**。
+預設 `pr_limit: 8`，所以 8 人團隊約 72 次呼叫。要壓成本有兩條路：
+`--pr-limit 4`（少讀幾個 PR）或 `--pr-limit 0`（完全跳過階段 1，退回純 metadata 評估）。
+
+快取在 `out/.ai_cache`：
+- 階段 1 的 key 含 PR 最後一個 commit SHA、留言數、以及「有沒有 diff」——
+  PR 沒變就不會重讀，之後補上 clone 會因為 key 變了而自動重評
+- 階段 2 的 key 是整個證據包的雜湊
+- `--no-cache` 強制重算

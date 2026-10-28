@@ -87,8 +87,10 @@
     "model": "sonnet",
     "min_samples": 5,
     "//min_samples": "少於這個 PR 數的人不給分，只標資料不足 —— 3 個 PR 的中位數是雜訊",
-    "//repo_paths": "有本機 clone 就能讀到真 diff，證據強度差一個量級：{\"repo-name\": \"/path/to/clone\"}",
+    "//repo_paths": "本機 clone 路徑，有的話才讀得到真 diff：{\"repo-name\": \"/path/to/clone\"}",
     "repo_paths": {},
-    "max_diff_chars": 60000
+    "max_diff_chars": 60000,
+    "pr_limit": 8,
+    "//pr_limit": "每人最多逐個評幾個 PR（0＝只做人層級彙總，便宜但評不出程式碼品質）"
   }
 }

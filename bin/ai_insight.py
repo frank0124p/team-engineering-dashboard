@@ -17,6 +17,7 @@
 """
 import argparse
 import hashlib
+import statistics
 import json
 import os
 import re
@@ -49,8 +50,171 @@ def _sh(cmd, stdin=None, timeout=600):
     return subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=timeout)
 
 
-def build_packet(person, prs, flow, cfg):
-    """一個人的證據包。給模型看的全部素材，不多也不少。"""
+# ── 階段 1：逐 PR 評估 ───────────────────────────────────────────
+# 為什麼要有這一層：只給模型 metadata（檔名、commit 訊息、留言數）時，實測
+# 六個面向有三個會被作廢 —— 程式碼品質、測試落實、審查貢獻都需要看到實際的
+# 程式碼才評得出來。有本機 clone 時讀真 diff，可信度差一個量級。
+PR_PROMPT_VERSION = "2026-10-28.1"
+PR_DIMENSIONS = ("code_quality", "change_design", "testing", "reliability")
+
+PR_PROMPT = """你是一位資深工程師，正在審閱一個已經合併的 Pull Request。
+這份評估會被聚合成工程師的產出品質參考，當事人有權檢視，所以只講看得到的事實。
+
+## PR
+{pr}
+
+## 評分面向（各 1–5 分，5 一律代表好）
+- code_quality：可讀性、命名、結構、重複程度、錯誤處理
+- change_design：PR 是否切得可審查、單一職責、有沒有混入無關改動
+- testing：有沒有附測試、測試是否涵蓋關鍵路徑而非湊數
+- reliability：這個改動上線會不會出事（邊界條件、相容性、回滾難度）
+
+分數的意思：1=明顯有問題　2=低於一般水準　3=符合預期　4=穩定優於預期　5=標竿
+**3 分是正常值。**
+
+## 硬性要求
+1. **沒有 diff 就不要評論程式碼細節。** 看不到的面向把 score 設成 null，
+   在 note 寫明缺什麼 —— 猜測比留空有害。
+2. observation 要是具體事實（「User.ts 的 null 檢查只做了一半」），
+   不要形容詞（「品質不佳」）。
+3. 不要因為 PR 小就給低分；重構與維護性工作本身就是有價值的產出。
+
+## 輸出
+只輸出 JSON，不要其他文字、不要程式碼區塊：
+{{"scores": {{"code_quality": 3, "change_design": 3, "testing": null, "reliability": 3}},
+  "observation": "一到兩句，講這個 PR 實際看到什麼",
+  "note": "看不到什麼（沒有就空字串）",
+  "work_character": "feature|bugfix|refactor|chore|test|docs|mixed"}}"""
+
+
+def local_diff(pr, cfg):
+    """本機有 clone 就讀真 diff。config.ai_insight.repo_paths = {"repo": "/path"}"""
+    ai = cfg.get("ai_insight") or {}
+    path = (ai.get("repo_paths") or {}).get(pr.get("repo"))
+    if not path or not os.path.isdir(path):
+        return None
+    commits = pr.get("commits") or []
+    if not commits:
+        return None
+    head, base = commits[-1].get("sha"), commits[0].get("sha")
+    if not head:
+        return None
+    limit = ai.get("max_diff_chars", 60000)
+    for args in (["diff", "--unified=3", f"{base}~1..{head}"] if base else [],
+                 ["show", "--unified=3", "--format=", head]):
+        if not args:
+            continue
+        try:
+            r = _sh(["git", "-C", path] + args, timeout=90)
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout[:limit]
+        except Exception:
+            continue
+    return None
+
+
+def _pr_cache_key(pr, has_diff):
+    commits = pr.get("commits") or []
+    sha = str(commits[-1].get("sha") or "")[:12] if commits else ""
+    raw = (f'{PR_PROMPT_VERSION}|{pr.get("repo")}#{pr.get("id")}|{sha}|'
+           f'{pr.get("comment_count", 0)}|{"diff" if has_diff else "meta"}')
+    return hashlib.sha256(raw.encode()).hexdigest()[:20]
+
+
+def assess_pr(pr, cfg, model=None, no_cache=False):
+    """評一個 PR。回傳 (結果, 證據強度, 來源)。"""
+    diff = None if (cfg.get("ai_insight") or {}).get("no_diff") else local_diff(pr, cfg)
+    level = "diff" if diff else "metadata"
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache = os.path.join(CACHE_DIR, f"pr-{_pr_cache_key(pr, bool(diff))}.json")
+    if os.path.exists(cache) and not no_cache:
+        try:
+            return json.load(open(cache, encoding="utf-8")), level, "cache"
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    commits = pr.get("commits") or []
+    body = {
+        "id": pr.get("id"), "repo": pr.get("repo"), "title": pr.get("title"),
+        "work_type": pr.get("work_item_type") or "",
+        "files_changed": pr.get("files_changed"),
+        "additions": pr.get("additions"), "deletions": pr.get("deletions"),
+        "commit_messages": [(c.get("message") or "").split("\n")[0][:120]
+                            for c in commits][:10],
+        "review_comments_received": pr.get("comment_count"),
+        "pushes_after_approval": pr.get("pushes_after_approval"),
+        "is_revert": bool(pr.get("is_revert")),
+    }
+    text = json.dumps(body, ensure_ascii=False, indent=1)
+    if diff:
+        text += "\n\n實際 diff：\n```diff\n" + diff + "\n```"
+    else:
+        text += "\n\n（沒有 diff —— 這台機器沒有這個 repo 的 clone。"
+    prompt = PR_PROMPT.format(pr=text)
+
+    cmd = ["claude", "-p", "--output-format", "json"]
+    if model:
+        cmd += ["--model", model]
+    r = _sh(cmd, stdin=prompt)
+    if r.returncode != 0:
+        raise RuntimeError(f"claude CLI 失敗：{r.stderr[:200]}")
+    try:
+        text_out = (json.loads(r.stdout) or {}).get("result") or ""
+    except json.JSONDecodeError:
+        text_out = r.stdout
+    mm = re.search(r"\{.*\}", text_out, re.S)
+    if not mm:
+        raise RuntimeError(f"模型沒回 JSON：{text_out[:200]}")
+    res = json.loads(mm.group(0))
+    json.dump(res, open(cache, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    return res, level, "fresh"
+
+
+def pr_level(person, mine, cfg, model=None, no_cache=False, limit=8):
+    """逐 PR 評估後聚合：每個面向的中位數、依據的 PR、證據強度組成。"""
+    picked = sorted(mine, key=lambda x: x.get("merged_at") or "")[-limit:]
+    rows, levels = [], {}
+    for pr in picked:
+        try:
+            res, lvl, src = assess_pr(pr, cfg, model=model, no_cache=no_cache)
+        except Exception as e:
+            print(f"    ⚠️ PR #{pr.get('id')} 評估失敗：{str(e)[:120]}", file=sys.stderr)
+            continue
+        levels[lvl] = levels.get(lvl, 0) + 1
+        sc = {}
+        for k in PR_DIMENSIONS:
+            v = (res.get("scores") or {}).get(k)
+            sc[k] = float(v) if isinstance(v, (int, float)) and 1 <= v <= 5 else None
+        rows.append({"pr": pr.get("id"), "title": pr.get("title", ""),
+                     "scores": sc, "observation": str(res.get("observation") or "")[:300],
+                     "note": str(res.get("note") or "")[:200],
+                     "work_character": res.get("work_character"),
+                     "evidence_level": lvl, "from": src})
+        print(f"    · PR #{pr.get('id')} {str(pr.get('title',''))[:34]}"
+              f"　{ {k: v for k, v in sc.items() if v} }　{lvl}/{src}", file=sys.stderr)
+
+    medians, evidence = {}, {}
+    for k in PR_DIMENSIONS:
+        vals = [(r["scores"][k], r["pr"]) for r in rows if r["scores"].get(k) is not None]
+        if len(vals) >= 2:
+            medians[k] = round(statistics.median([v for v, _ in vals]), 1)
+            # 證據取分數最低與最高的那幾個 PR —— 討論時最有話講
+            vals.sort(key=lambda x: x[0])
+            picked_ids = [pid for _, pid in vals[:2]] + [pid for _, pid in vals[-2:]]
+            evidence[k] = list(dict.fromkeys(picked_ids))
+        else:
+            medians[k] = None
+            evidence[k] = [pid for _, pid in vals]
+    return {"assessed": len(rows), "medians": medians, "evidence": evidence,
+            "evidence_mix": levels, "prs": rows,
+            "prompt_version": PR_PROMPT_VERSION}
+
+
+def build_packet(person, prs, flow, cfg, prl=None):
+    """一個人的證據包。給模型看的全部素材，不多也不少。
+
+    prl 是階段 1（逐 PR，看過真 diff）的結果 —— 有它的話，模型就不是憑
+    metadata 猜程式碼品質，而是在整合「已經逐個讀過的結論」。"""
     mine = [p for p in prs if p.get("author") == person["id"]]
     unit = flow.get("size_unit", "個檔")
     items = []
@@ -91,6 +255,16 @@ def build_packet(person, prs, flow, cfg):
             "ai_assisted_pct": person.get("ai_pct"),
         },
         "pull_requests": items,
+        "pr_level_review": ({
+            "說明": "以下是逐個 PR 讀過之後的結論（有 diff 的部分可信度高）。"
+                    "整合時以這些觀察為主，不要另外臆測程式碼細節。",
+            "已評估 PR 數": prl["assessed"],
+            "證據強度組成": prl["evidence_mix"],
+            "各面向中位數": prl["medians"],
+            "逐 PR 觀察": [{"pr": r["pr"], "scores": r["scores"],
+                            "observation": r["observation"], "note": r["note"],
+                            "evidence_level": r["evidence_level"]} for r in prl["prs"]],
+        } if prl and prl.get("assessed") else None),
     }
 
 
@@ -182,6 +356,13 @@ def _validate(result, valid_prs):
     return scores, dropped
 
 
+def zh_of(key):
+    for k, zh, _w, _d in DIMENSIONS:
+        if k == key:
+            return zh
+    return key
+
+
 def overall(scores):
     """加權總分，只用有證據的面向，並回報涵蓋率。"""
     num = den = 0.0
@@ -195,7 +376,7 @@ def overall(scores):
     return round(num / den, 2), round(den, 2)
 
 
-def run(cfg, m, data, only=None, model=None, no_cache=False):
+def run(cfg, m, data, only=None, model=None, no_cache=False, pr_limit=None):
     flow = m["current"]["flow"]
     # 證據包只能放「觀測窗內」的 PR —— 放進基準期的 PR 會讓明細筆數
     # 和彙總數字對不上，模型會（正確地）判定資料不可信而拒絕評分
@@ -225,7 +406,14 @@ def run(cfg, m, data, only=None, model=None, no_cache=False):
             print(f"  · {person['name']}：PR {n} 個 → 樣本不足，略過評分", file=sys.stderr)
             continue
 
-        packet = build_packet(person, merged, flow, cfg)
+        mine = [p for p in merged if p.get("author") == person["id"]]
+        ai_cfg = cfg.get("ai_insight") or {}
+        lim = pr_limit if pr_limit is not None else ai_cfg.get("pr_limit", 8)
+        prl = None
+        if lim > 0:
+            print(f"  · {person['name']}：逐 PR 評估（最多 {lim} 個）…", file=sys.stderr)
+            prl = pr_level(person, mine, cfg, model=model, no_cache=no_cache, limit=lim)
+        packet = build_packet(person, merged, flow, cfg, prl=prl)
         valid = {it["pr"] for it in packet["pull_requests"]}
         try:
             res, src = assess(packet, model=model, no_cache=no_cache)
@@ -236,6 +424,24 @@ def run(cfg, m, data, only=None, model=None, no_cache=False):
             continue
 
         scores, dropped = _validate(res, valid)
+        # 程式碼相關的四個面向，分數改用「逐 PR 中位數」—— 那是一個一個讀出來的，
+        # 可追溯；模型在人層級給的分數只留 reason 與證據 PR。
+        if prl:
+            for k in PR_DIMENSIONS:
+                med = prl["medians"].get(k)
+                if med is None:
+                    continue
+                ev = [e for e in (prl["evidence"].get(k) or []) if e in valid]
+                cur_reason = (scores.get(k) or {}).get("reason") or ""
+                scores[k] = {
+                    "score": round(med),
+                    "reason": (cur_reason or "逐 PR 評估的中位數")
+                              + f"（逐 PR 中位數 {med}，{prl['assessed']} 個 PR）",
+                    "evidence": ev[:6] or ((scores.get(k) or {}).get("evidence") or [])[:6],
+                    "dropped": False,
+                }
+                if zh_of(k) in dropped:
+                    dropped.remove(zh_of(k))
         score, coverage = overall(scores)
         row.update({
             "scored": score is not None,
@@ -250,6 +456,11 @@ def run(cfg, m, data, only=None, model=None, no_cache=False):
             "coaching": res.get("coaching", [])[:4],
             "data_gaps": res.get("data_gaps", [])[:4],
             "source": src,
+            # 可追溯：這些分數是從哪幾個 PR 讀出來的、有沒有真 diff
+            "pr_level": ({"assessed": prl["assessed"], "medians": prl["medians"],
+                          "evidence_mix": prl["evidence_mix"],
+                          "prompt_version": prl["prompt_version"],
+                          "prs": prl["prs"]} if prl else None),
         })
         out["people"].append(row)
         print(f"  · {person['name']}：{score if score else '—'}"
@@ -270,6 +481,10 @@ def main():
     ap.add_argument("--only", nargs="*", help="只評估這幾位（名字）")
     ap.add_argument("--model", help="指定模型，預設用 CLI 的設定")
     ap.add_argument("--no-cache", action="store_true", help="忽略快取重跑")
+    ap.add_argument("--pr-limit", type=int,
+                    help="每人最多逐個評幾個 PR（預設 8，0＝跳過逐 PR 只做人層級）")
+    ap.add_argument("--no-diff", action="store_true",
+                    help="不讀本機 clone 的 diff（只用 metadata，便宜但評不出程式碼品質）")
     ap.add_argument("--source", choices=["azdo", "demo", "auto"])
     a = ap.parse_args()
 
@@ -281,7 +496,10 @@ def main():
 
     print(f"🤖 AI 評估：{len(m['current']['people'])} 位成員，"
           f"觀測窗 {cfg.get('window_days', 28)} 天", file=sys.stderr)
-    out = run(cfg, m, data, only=a.only, model=a.model, no_cache=a.no_cache)
+    if a.no_diff:
+        cfg.setdefault("ai_insight", {})["no_diff"] = True
+    out = run(cfg, m, data, only=a.only, model=a.model, no_cache=a.no_cache,
+              pr_limit=a.pr_limit)
 
     path = os.path.join(ROOT, "out", "ai_insight.json")
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -290,6 +508,15 @@ def main():
     ts = out["team_summary"]
     print(f"   評分 {ts['assessed']} 位 / 樣本不足 {ts['skipped']} 位"
           f"｜中位數 {ts['median']}", file=sys.stderr)
+    mix = {}
+    for pp in out["people"]:
+        for k, v in ((pp.get("pr_level") or {}).get("evidence_mix") or {}).items():
+            mix[k] = mix.get(k, 0) + v
+    if mix:
+        print(f"   逐 PR 證據組成：{mix}"
+              + ("　⚠️ 全部只有 metadata，程式碼品質類分數可信度低；"
+                 "設定 ai_insight.repo_paths 指到本機 clone 才讀得到 diff"
+                 if mix.get("diff", 0) == 0 else ""), file=sys.stderr)
     return 0
 
 

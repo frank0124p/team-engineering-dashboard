@@ -123,6 +123,43 @@ bash bin/daily.sh                    # 重建 + 印摘要（排程用）
 
 ---
 
+## AI 產出品質評估（AI Insight）
+
+用本機的 Claude Code CLI 讀 PR，產出六面向評分與證據，給績效對話當**參考資料**。
+
+```bash
+/usr/bin/python3 bin/ai_insight.py                  # 全員
+/usr/bin/python3 bin/ai_insight.py --only "Amy Chen"
+/usr/bin/python3 bin/ai_insight.py --pr-limit 4     # 控成本
+/usr/bin/python3 bin/dashboard.py --ai              # 評估 + 重建儀表板
+```
+
+**要先設 clone 路徑，不然評不出程式碼品質**：
+
+```json
+"ai_insight": {
+  "repo_paths": {"core-api": "/Users/you/work/core-api"},
+  "pr_limit": 8,
+  "min_samples": 5
+}
+```
+
+實測差異：只有 metadata（檔名＋commit 訊息）時，六個面向有三個會被模型判定「資料不足」而作廢，
+涵蓋率只有 45%；讀得到真 diff 時四個程式碼面向全部評得出來，而且會指出具體問題。
+
+**三個不可移除的護欄**（寫在 METRICS.md 9.2，上線前請團隊一起讀 9.4 與 9.5）：
+
+1. **每個分數都要有證據 PR**，且程式會驗證那些 PR 真的存在於該人該期間 ——
+   舉不出證據的分數一律作廢、不計入總分，頁面會標出來
+2. **PR 少於 5 個不給分**，只給觀察（`min_samples`）。樣本太小推不出品質
+3. **分數不可直接換算考績**。它是對話起點，用途是減少「憑印象打分」；
+   當事人有權看到自己的評估理由與依據的 PR
+
+程式碼相關的四個面向，分數取**逐 PR 評估的中位數**（可往下追到 `people[].pr_level.prs`），
+不是模型在人層級憑印象給的。
+
+---
+
 ## 搬到公司環境的注意事項
 
 - **只依賴 Python 標準庫**，不需要 pip install。`/usr/bin/python3`（3.9+）就能跑。
