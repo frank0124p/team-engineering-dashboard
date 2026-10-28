@@ -189,9 +189,13 @@ def build(m, standalone=True):
     cur, base, d, wk = m["current"], m["baseline"], m["deltas"], m["weekly"]
     dora, flow, ai = cur["dora"], cur["flow"], cur["ai"]
     th = m["meta"]["thresholds"]
+    unit = flow.get("size_unit") or "個檔"            # files→個檔、lines→行
+    slimit = flow.get("size_limit") or th.get("pr_size_healthy_files", 10)
+    size_word = f"PR 大小（{unit}）"
     R = {"Elite": "good", "High": "good", "Medium": "warning", "Low": "critical", "—": "muted"}
     LV = {"Medium": "warn", "Low": "crit"}
     demo = m["meta"]["source"] == "mock"
+    sc = m["meta"].get("scope") or {}
     title = "{}・工程產出儀表板".format(m["meta"]["team"])
     gen = esc(m["meta"]["generated_at"][:16].replace("T", " "))
     rr = dora["ratings"]
@@ -200,9 +204,17 @@ def build(m, standalone=True):
     P.append('<header class="top"><div>'
              f'<h1>{esc(title)}</h1>'
              f'<p class="sub">觀測窗 {m["meta"]["window_days"]} 天（對比前 {base["days"]} 天） · {gen} UTC</p></div>'
-             + ('<span class="badge demo">⚠ 示範資料（雛形）</span>' if demo
-                else '<span class="badge">Azure DevOps</span>')
+             + ('<span class="badge demo">⚠ 示範資料</span>' if demo
+                else f'<span class="badge">{esc(sc.get("organization", "Azure DevOps"))}'
+                     + (f" / {esc(sc.get('project'))}" if sc.get("project") else "") + '</span>')
              + '</header>')
+    # 注意：rr 在上面已經是 dora["ratings"]，這裡不能覆用同一個名字
+    rost = m["meta"].get("roster_report") or {}
+    if rost.get("missing"):
+        P.append('<div class="lede" style="border-bottom:none"><div style="grid-column:1/-1">'
+                 '<span class="eyebrow">名單檢查</span>'
+                 f'<p>名單裡這幾位在觀測窗內沒有任何合併 PR，確認一下是不是打錯字或換了帳號：'
+                 f'<b>{esc("、".join(rost["missing"][:10]))}</b></p></div></div>')
 
     # ---- 開頭結論 + 需要留意 ----
     al = metrics.alerts(m)
@@ -290,7 +302,7 @@ def build(m, standalone=True):
                  + table(["指標", "AI 協助 PR", "人工 PR"], [
                      ["PR 數", a["count"], h["count"]],
                      cmp_row("週期時間（中位）", "cycle_p50", fmt_h),
-                     cmp_row("變更行數（中位）", "size_p50"),
+                     cmp_row(f"PR 大小（中位・{unit}）", "size_p50"),
                      cmp_row("審查耗時（中位）", "review_h_p50", fmt_h),
                      cmp_row("審查留言數（中位）", "comments_p50"),
                      cmp_row("核准後回工率", "rework_pct", lambda v: fmt_num(v, "%")),
@@ -307,8 +319,8 @@ def build(m, standalone=True):
     P.append(_tile("每人每週合併 PR", fmt_num(flow["pr_per_dev_week"]),
                    f'{flow["pr_merged"]} 個 PR / {flow["active_devs"]} 人　{delta_html(d["flow.pr_per_dev_week"])}'))
     over = flow["pr_oversize_pct"] > 30
-    P.append(_tile("PR 變更行數（中位）", fmt_num(flow["pr_size_p50"]),
-                   f'超過 {th["pr_size_healthy_lines"]} 行者佔 {flow["pr_oversize_pct"]}%　'
+    P.append(_tile(f"PR 大小中位（{unit}）", fmt_num(flow["pr_size_p50"]),
+                   f'超過 {slimit}{unit}者佔 {flow["pr_oversize_pct"]}%　'
                    f'{delta_html(d["flow.pr_size_p50"], True)}', level="warn" if over else None))
     cov_ok = flow["review_coverage_pct"] >= th["review_coverage_target_pct"]
     P.append(_tile("審查覆蓋率", fmt_num(flow["review_coverage_pct"]) + _u("%"),
@@ -337,10 +349,10 @@ def build(m, standalone=True):
              + '</div>')
 
     P.append('<div class="grid2">')
-    P.append('<div><h3>PR 變更行數分佈</h3>'
-             f'<p class="note">橘色為超過健康上限 {th["pr_size_healthy_lines"]} 行的區間。</p>'
-             + chart_hist(flow["size_histogram"], th["pr_size_healthy_lines"])
-             + details_table("以表格檢視", ["變更行數", "PR 數"],
+    P.append(f'<div><h3>PR 大小分佈（{unit}）</h3>'
+             f'<p class="note">橘色為超過健康上限 {slimit}{unit}的區間。</p>'
+             + chart_hist(flow["size_histogram"], slimit)
+             + details_table("以表格檢視", [f"PR 大小（{unit}）", "PR 數"],
                              [[b["label"], b["count"]] for b in flow["size_histogram"]]) + '</div>')
     P.append('<div><h3>每週 PR 週期時間（中位數）</h3>'
              '<p class="note">單位：小時。觀察導入 AI 後交付速度是否真的變快。</p>'
@@ -392,7 +404,7 @@ def build(m, standalone=True):
             '<span class="name" style="color:var(--muted)">'
             + (esc("・".join(warn)) if warn else "—") + '</span>',
         ])
-    P.append(table(["成員", "小組", "合併 PR", "PR/週", "週期時間", "PR 行數",
+    P.append(table(["成員", "小組", "合併 PR", "PR/週", "週期時間", f"PR 大小({unit})",
                     "AI 比例", "擔任審查", "回工率", "可留意"], rows))
     P.append('</div></section>')
 
@@ -400,7 +412,7 @@ def build(m, standalone=True):
     P.append(_sec("Repositories", "Repository 視圖",
                   "某個 repo 的週期時間或 PR 大小明顯偏高，通常指向測試覆蓋或架構債務。"))
     P.append('<div class="pad">'
-             + table(["REPO", "合併 PR", "週期時間", "PR 行數（中位）", "AI 比例"],
+             + table(["REPO", "合併 PR", "週期時間", f"PR 大小（中位・{unit}）", "AI 比例"],
                      [[f'<span class="name">{esc(r["repo"])}</span>', r["pr_merged"],
                        fmt_h(r["cycle_p50"]), fmt_num(r["size_p50"]), f'{r["ai_pct"]}%'] for r in cur["repos"]])
              + '</div></section>')

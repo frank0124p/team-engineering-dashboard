@@ -155,6 +155,8 @@ def fetch(cfg, now=None):
 
     return {
         "source": "mock",
+        "size_metric": cfg.get("pr_size_metric", "files"),
+        "scope": {"organization": "（示範）", "project": "（示範）"},
         "generated_at": _iso(now),
         "now": _iso(now),
         "people": [{"id": p[0], "name": p[1], "team": p[2]} for p in PEOPLE],

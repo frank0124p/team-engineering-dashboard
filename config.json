@@ -1,41 +1,66 @@
 {
-  "_comment": "團隊產出儀表板設定。source=mock 為雛形示範資料；拿到公司權限後改成 azdo。",
-  "source": "mock",
-
+  "//": "進 git 的預設值，不要放公司資訊或 PAT。setup.py 會把你的設定寫到 config.local.json（已被 .gitignore 排除）。",
+  "source": "auto",
+  "//source": "auto=有 PAT 就連 Azure DevOps，沒有就跑示範資料｜azdo｜demo",
   "azdo": {
-    "organization": "YOUR_ORG",
-    "project": "YOUR_PROJECT",
+    "//": "留空會用 PAT 自動偵測；只有一個組織/專案時完全不用填。",
+    "organization": "",
+    "project": "",
     "repos": [],
     "pat_env": "AZDO_PAT",
     "pat_keychain_service": "azdo-pat",
     "api_version": "7.1",
     "deployment_pipelines": [],
-    "production_environments": ["Production", "prod"]
+    "production_environments": [
+      "Production",
+      "prod",
+      "PROD"
+    ]
   },
-
+  "team": {
+    "name": "我的團隊",
+    "//members": "email 或顯示名稱都認，混著寫也可以。留空＝專案內所有人（排除機器人）。",
+    "members": [],
+    "members_mode": "include"
+  },
   "window_days": 28,
   "baseline_days": 28,
-
-  "team": {
-    "name": "Platform Team",
-    "exclude_bots": true,
-    "bot_patterns": ["bot", "[bot]", "service account", "azure pipelines", "dependabot", "renovate"]
-  },
-
+  "//pr_size_metric": "files=改了幾個檔（Azure API 直接給，準）｜lines=改了幾行（需要本機 clone）",
+  "pr_size_metric": "files",
   "ai_detection": {
-    "mode": "commit_trailer",
     "trailers": [
-      {"tool": "Claude Code", "pattern": "(?i)co-authored-by:\\s*claude"},
-      {"tool": "GitHub Copilot", "pattern": "(?i)co-authored-by:\\s*copilot"},
-      {"tool": "Cursor", "pattern": "(?i)co-authored-by:\\s*cursor"},
-      {"tool": "Codex", "pattern": "(?i)co-authored-by:.*codex"},
-      {"tool": "Gemini", "pattern": "(?i)co-authored-by:\\s*gemini"},
-      {"tool": "Generic", "pattern": "(?i)generated with \\[?(claude code|codex|copilot)"}
+      {
+        "tool": "Claude Code",
+        "pattern": "(?i)co-authored-by:\\s*claude"
+      },
+      {
+        "tool": "GitHub Copilot",
+        "pattern": "(?i)co-authored-by:\\s*copilot"
+      },
+      {
+        "tool": "Cursor",
+        "pattern": "(?i)co-authored-by:\\s*cursor"
+      },
+      {
+        "tool": "Codex",
+        "pattern": "(?i)co-authored-by:.*codex"
+      },
+      {
+        "tool": "Gemini",
+        "pattern": "(?i)co-authored-by:\\s*gemini"
+      },
+      {
+        "tool": "Generic",
+        "pattern": "(?i)generated with \\[?(claude code|codex|copilot)"
+      }
     ],
-    "pr_labels": ["ai-assisted", "ai"]
+    "pr_labels": [
+      "ai-assisted",
+      "ai"
+    ]
   },
-
   "thresholds": {
+    "pr_size_healthy_files": 10,
     "pr_size_healthy_lines": 400,
     "pickup_time_target_hours": 24,
     "review_time_target_hours": 24,
@@ -43,10 +68,16 @@
     "stale_pr_days": 7,
     "review_coverage_target_pct": 90
   },
-
+  "bot_patterns": [
+    "bot",
+    "[bot]",
+    "service account",
+    "azure pipelines",
+    "dependabot",
+    "renovate"
+  ],
   "output": {
     "html_path": "out/team-dashboard.html",
-    "json_path": "out/metrics.json",
-    "discord_channel_id": ""
+    "json_path": "out/metrics.json"
   }
 }

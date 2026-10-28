@@ -1,238 +1,258 @@
-"""Azure DevOps 資料來源 — 把 REST API 的回應正規化成與 mock_source 相同的結構。
+# -*- coding: utf-8 -*-
+"""Azure DevOps 來源：把 REST 回應正規化成與 mock_source 相同的結構。
 
-認證順序：環境變數 (config.azdo.pat_env) → macOS Keychain (pat_keychain_service)。
-用到的 API（皆為唯讀）:
-  GET /_apis/git/repositories
-  GET /_apis/git/repositories/{repo}/pullrequests?searchCriteria.status=all
-  GET /_apis/git/repositories/{repo}/pullRequests/{id}/commits
-  GET /_apis/git/repositories/{repo}/pullRequests/{id}/threads
-  GET /_apis/git/repositories/{repo}/pullRequests/{id}/iterations
-  GET /_apis/pipelines/runs  或  /_apis/build/builds
-  GET /_apis/distributedtask/... (environments / deployment records)
+只需要 PAT 與團隊名單；組織／專案／repo 沒填就自動偵測。
+PR 大小預設以「改了幾個檔」計算 —— Azure 的 API 不直接提供行數，
+硬湊出來的行數會失真，寧可用一個準確的單位。
 """
-import base64
-import json
 import os
 import re
-import subprocess
+import sys
 import urllib.parse
-import urllib.request
 from datetime import datetime, timedelta, timezone
 
-API = "https://dev.azure.com"
-VSRM = "https://vsrm.dev.azure.com"
-
-
-def _pat(cfg):
-    tok = os.environ.get(cfg.get("pat_env", "AZDO_PAT"), "").strip()
-    if tok:
-        return tok
-    svc = cfg.get("pat_keychain_service")
-    if svc:
-        try:
-            out = subprocess.run(
-                ["security", "find-generic-password", "-s", svc, "-w"],
-                capture_output=True, text=True, timeout=10)
-            if out.returncode == 0 and out.stdout.strip():
-                return out.stdout.strip()
-        except Exception:
-            pass
-    raise SystemExit(
-        f"找不到 Azure DevOps PAT。請設定環境變數 {cfg.get('pat_env','AZDO_PAT')}，"
-        f"或執行: security add-generic-password -s {cfg.get('pat_keychain_service')} -a $USER -w '<PAT>'")
-
-
-class Client:
-    def __init__(self, cfg):
-        self.cfg = cfg
-        self.org = cfg["organization"]
-        self.project = cfg["project"]
-        self.api_version = cfg.get("api_version", "7.1")
-        auth = base64.b64encode(f":{_pat(cfg)}".encode()).decode()
-        self.headers = {"Authorization": f"Basic {auth}", "Accept": "application/json"}
-
-    def get(self, path, params=None, base=API):
-        params = dict(params or {})
-        params.setdefault("api-version", self.api_version)
-        url = f"{base}/{self.org}/{urllib.parse.quote(self.project)}{path}?{urllib.parse.urlencode(params)}"
-        req = urllib.request.Request(url, headers=self.headers)
-        with urllib.request.urlopen(req, timeout=60) as r:
-            return json.loads(r.read().decode())
-
-    def paged(self, path, params=None, base=API, page=200, cap=5000):
-        params = dict(params or {})
-        skip, out = 0, []
-        while len(out) < cap:
-            params["$top"] = page
-            params["$skip"] = skip
-            batch = self.get(path, params, base).get("value", [])
-            out.extend(batch)
-            if len(batch) < page:
-                break
-            skip += page
-        return out
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from azdo_client import Client, AzdoError, discover            # noqa: E402
+from config_loader import Roster, resolve_pat                 # noqa: E402
 
 
 def _iso(s):
-    """Azure DevOps 回傳的時間字串 → 統一的 UTC ISO8601 Z 格式。"""
     if not s:
         return None
     s = s.replace("Z", "+00:00")
-    s = re.sub(r"\.(\d{6})\d+", r".\1", s)          # 截掉超過 6 位的小數秒
-    return datetime.fromisoformat(s).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    s = re.sub(r"\.(\d{6})\d+", r".\1", s)          # 小數秒超過 6 位 fromisoformat 會炸
+    try:
+        return datetime.fromisoformat(s).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    except ValueError:
+        return None
 
 
 def _ident(x):
     if not x:
         return (None, None)
-    return (x.get("uniqueName") or x.get("displayName"), x.get("displayName"))
+    return (x.get("uniqueName") or x.get("mailAddress") or x.get("displayName"),
+            x.get("displayName"))
 
 
 def fetch(cfg, now=None):
-    az = cfg["azdo"]
-    c = Client(az)
+    pat, pat_src = resolve_pat(cfg, required=True)
+    c = Client(pat, cfg.get("azdo", {}).get("api_version", "7.1"))
+    scope, me = discover(c, cfg)
+    org, project = scope["organization"], scope["project"]
+    roster = Roster(cfg)
+
     now = now or datetime.now(timezone.utc)
-    since = now - timedelta(days=cfg.get("window_days", 28) + cfg.get("baseline_days", 28) + 7)
+    lookback = cfg.get("window_days", 28) + cfg.get("baseline_days", 28) + 7
+    since = (now - timedelta(days=lookback)).isoformat().replace("+00:00", "Z")
 
-    repos = az.get("repos") or [r["name"] for r in c.get("/_apis/git/repositories")["value"]]
+    size_metric = cfg.get("pr_size_metric", "files")
     people, prs = {}, []
+    pr_merge_sha = {}
 
-    for repo in repos:
+    for repo in scope["repos"]:
         rp = urllib.parse.quote(repo)
-        raw = c.paged(f"/_apis/git/repositories/{rp}/pullrequests",
-                      {"searchCriteria.status": "all", "searchCriteria.targetRefName": "refs/heads/main"})
+        try:
+            raw = c.paged(org, project, f"/_apis/git/repositories/{rp}/pullrequests",
+                          {"searchCriteria.status": "all"})
+        except AzdoError as e:
+            print(f"[warn] repo {repo} 讀取失敗，略過：{e}", file=sys.stderr)
+            continue
+
         for pr in raw:
             created = _iso(pr.get("creationDate"))
-            if created and created < since.isoformat().replace("+00:00", "Z"):
+            if not created or created < since:
                 continue
-            uid, name = _ident(pr.get("createdBy"))
-            if uid:
-                people.setdefault(uid, {"id": uid, "name": name or uid, "team": ""})
+            uid, dname = _ident(pr.get("createdBy"))
+            if not roster.includes(author=uid, author_name=dname, email=uid):
+                continue
+            people.setdefault(uid, {"id": uid, "name": dname or uid, "team": ""})
 
             pid = pr["pullRequestId"]
+            base = f"/_apis/git/repositories/{rp}/pullRequests/{pid}"
             commits = [{
                 "sha": cm.get("commitId"),
-                "author": (cm.get("author") or {}).get("email"),
+                "author": ((cm.get("author") or {}).get("email")),
                 "authored_at": _iso((cm.get("author") or {}).get("date")),
                 "message": cm.get("comment") or "",
-            } for cm in c.get(f"/_apis/git/repositories/{rp}/pullRequests/{pid}/commits").get("value", [])]
+            } for cm in c.get(org, project, base + "/commits").get("value", [])]
 
-            threads = c.get(f"/_apis/git/repositories/{rp}/pullRequests/{pid}/threads").get("value", [])
-            # 第一則「人類寫的」留言時間 = pickup time 的終點
-            review_times = []
-            comment_count = 0
-            for t in threads:
-                for cmt in t.get("comments", []):
-                    if cmt.get("commentType") == "system":
-                        continue
-                    a_uid, _ = _ident(cmt.get("author"))
-                    if a_uid and a_uid != uid:
-                        review_times.append(_iso(cmt.get("publishedDate")))
-                    comment_count += 1
-            first_review = min([x for x in review_times if x], default=None)
+            first_review, first_approval, comment_count, pushes_after = \
+                _review_timeline(c, org, project, base, uid, pr)
 
-            # 核准時間：取最早一位投 vote>=10 的 reviewer
-            approvals = [_iso(pr.get("closedDate"))] if pr.get("status") == "completed" else []
-            reviewers = []
-            for rv in pr.get("reviewers", []):
-                r_uid, r_name = _ident(rv)
-                if r_uid:
-                    reviewers.append(r_uid)
-                    people.setdefault(r_uid, {"id": r_uid, "name": r_name or r_uid, "team": ""})
-            first_approval = min([a for a in approvals if a], default=None)
-
-            # 變更行數需逐 iteration 取 diff，成本高 → 以 commit changeCounts 近似
-            stats = _pr_size(c, rp, pid)
+            size = _pr_size(c, org, project, rp, pid, size_metric)
             merged = _iso(pr.get("closedDate")) if pr.get("status") == "completed" else None
+            merge_sha = (pr.get("lastMergeCommit") or {}).get("commitId")
+            if merged and merge_sha:
+                pr_merge_sha[merge_sha] = pid
 
             prs.append({
                 "id": pid,
                 "repo": repo,
                 "title": pr.get("title", ""),
                 "author": uid,
-                "author_name": name or uid,
+                "author_name": dname or uid,
                 "team": "",
-                "first_commit_at": min([x["authored_at"] for x in commits if x["authored_at"]], default=created),
+                "first_commit_at": min([x["authored_at"] for x in commits
+                                        if x["authored_at"]], default=created),
                 "created_at": created,
                 "first_review_at": first_review,
                 "first_approval_at": first_approval or first_review,
                 "merged_at": merged,
                 "closed_at": _iso(pr.get("closedDate")),
-                "status": pr.get("status"),             # active / completed / abandoned
-                "additions": stats["additions"],
-                "deletions": stats["deletions"],
-                "files_changed": stats["files"],
-                "reviewers": reviewers,
+                "status": pr.get("status"),
+                "additions": size["additions"],
+                "deletions": size["deletions"],
+                "files_changed": size["files"],
+                "reviewers": [_ident(rv)[0] for rv in pr.get("reviewers", []) if _ident(rv)[0]],
                 "comment_count": comment_count,
-                "pushes_after_approval": 0,
+                "pushes_after_approval": pushes_after,
                 "work_item_type": "",
                 "target_branch": (pr.get("targetRefName") or "").replace("refs/heads/", ""),
-                "labels": [l.get("name") for l in pr.get("labels", [])],
+                "labels": [l.get("name") for l in (pr.get("labels") or [])],
                 "commits": commits,
-                "is_revert": bool(re.match(r"(?i)^revert", pr.get("title", ""))),
+                "is_revert": bool(re.match(r"(?i)^\s*revert", pr.get("title", ""))),
             })
 
-    deployments, incidents = _fetch_deployments(c, cfg, repos)
+    _attach_work_item_types(c, org, project, prs)
+    deployments, incidents = _deployments(c, org, project, cfg, scope, pr_merge_sha, since)
+
     return {
         "source": "azdo",
         "generated_at": now.isoformat().replace("+00:00", "Z"),
         "now": now.isoformat().replace("+00:00", "Z"),
+        "scope": {"organization": org, "project": project,
+                  "repos": scope["repos"], "pat_source": pat_src, "signed_in_as": me.get("name")},
+        "roster_report": roster.report(),
+        "size_metric": size_metric,
         "people": list(people.values()),
-        "repos": repos,
+        "repos": scope["repos"],
         "pull_requests": prs,
         "deployments": deployments,
         "incidents": incidents,
     }
 
 
-def _pr_size(c, repo_q, pid):
-    """用最後一個 iteration 的 changes 概算 PR 大小。"""
+def _review_timeline(c, org, project, base, author_uid, pr):
+    """從討論串推出首次審查、核准時間、留言數、核准後又推了幾次。"""
+    threads = c.get(org, project, base + "/threads").get("value", [])
+    review_times, approve_times, comments = [], [], 0
+    for t in threads:
+        props = t.get("properties") or {}
+        vote = (props.get("CodeReviewVoteResult") or {}).get("$value")
+        t_time = _iso(t.get("publishedDate"))
+        if vote is not None and int(vote) >= 10 and t_time:
+            approve_times.append(t_time)
+        for cm in t.get("comments", []):
+            if cm.get("commentType") == "system":
+                continue
+            a_uid, _ = _ident(cm.get("author"))
+            comments += 1
+            if a_uid and a_uid != author_uid:
+                ts = _iso(cm.get("publishedDate"))
+                if ts:
+                    review_times.append(ts)
+    first_review = min(review_times, default=None)
+    first_approval = min(approve_times, default=None)
+
+    pushes_after = 0
+    if first_approval:
+        its = c.get(org, project, base + "/iterations").get("value", [])
+        pushes_after = len([i for i in its
+                            if (_iso(i.get("createdDate")) or "") > first_approval])
+    return first_review, first_approval, comments, pushes_after
+
+
+def _pr_size(c, org, project, repo_q, pid, metric):
+    """PR 大小。
+
+    Azure DevOps 的 PR API 不提供增刪行數，硬估會失真 —— 所以預設改用
+    「變更檔案數」這個 API 直接給、而且準確的單位。
+    需要行數時把 pr_size_metric 設成 lines，另由本機 git 取得（見 README）。
+    """
     try:
-        its = c.get(f"/_apis/git/repositories/{repo_q}/pullRequests/{pid}/iterations").get("value", [])
+        its = c.get(org, project,
+                    f"/_apis/git/repositories/{repo_q}/pullRequests/{pid}/iterations"
+                    ).get("value", [])
         if not its:
             return {"additions": 0, "deletions": 0, "files": 0}
         last = its[-1]["id"]
-        ch = c.get(f"/_apis/git/repositories/{repo_q}/pullRequests/{pid}/iterations/{last}/changes")
-        entries = ch.get("changeEntries", [])
+        ch = c.get(org, project,
+                   f"/_apis/git/repositories/{repo_q}/pullRequests/{pid}"
+                   f"/iterations/{last}/changes")
+        entries = [e for e in ch.get("changeEntries", [])
+                   if not (e.get("item") or {}).get("isFolder")]
         return {"additions": 0, "deletions": 0, "files": len(entries)}
-    except Exception:
+    except AzdoError:
         return {"additions": 0, "deletions": 0, "files": 0}
 
 
-def _fetch_deployments(c, cfg, repos):
-    """部署與失敗事件。優先讀 Pipelines runs；沒有就退回 Builds。"""
-    az = cfg["azdo"]
-    want = set(az.get("deployment_pipelines") or [])
+def _attach_work_item_types(c, org, project, prs):
+    """PR 關聯的工作項目類型 → Impact 面向的工作配比。"""
+    for pr in prs:
+        try:
+            links = c.get(org, project,
+                          f"/_apis/git/repositories/{urllib.parse.quote(pr['repo'])}"
+                          f"/pullRequests/{pr['id']}/workitems").get("value", [])
+            if not links:
+                continue
+            wid = links[0].get("id")
+            wi = c.get(org, project, f"/_apis/wit/workitems/{wid}",
+                       {"fields": "System.WorkItemType"})
+            pr["work_item_type"] = (wi.get("fields") or {}).get("System.WorkItemType", "")
+        except AzdoError:
+            continue
+
+
+def _deployments(c, org, project, cfg, scope, pr_merge_sha, since):
+    """生產環境部署與失敗事件。用 commit SHA 把部署接回 PR，
+    AI PR vs 人工 PR 的變更失敗率才算得出來。"""
+    want = set(scope.get("deployment_pipelines") or [])
+    prod = {p.lower() for p in (scope.get("production_environments") or ["production"])}
     deployments, incidents = [], []
+
     try:
-        runs = c.get("/_apis/pipelines/runs").get("value", [])
-    except Exception:
-        runs = c.get("/_apis/build/builds", {"statusFilter": "completed"}).get("value", [])
+        runs = c.get(org, project, "/_apis/pipelines/runs").get("value", [])
+        get_sha = lambda r: (((r.get("resources") or {}).get("repositories") or {})
+                             .get("self") or {}).get("version")
+        get_name = lambda r: (r.get("pipeline") or {}).get("name") or ""
+        get_fin = lambda r: r.get("finishedDate")
+    except AzdoError:
+        runs = c.paged(org, project, "/_apis/build/builds", {"statusFilter": "completed"})
+        get_sha = lambda r: r.get("sourceVersion")
+        get_name = lambda r: (r.get("definition") or {}).get("name") or ""
+        get_fin = lambda r: r.get("finishTime")
+
     for r in runs:
-        pname = (r.get("pipeline") or {}).get("name") or (r.get("definition") or {}).get("name") or ""
-        if want and pname not in want:
+        name = get_name(r)
+        if want and name not in want:
             continue
+        if not want and prod and not any(p in name.lower() for p in prod):
+            # 沒指定管線時，用名稱篩掉明顯不是部署的（CI、PR 驗證）
+            if re.search(r"(?i)\b(ci|pr|build|test|lint)\b", name):
+                continue
+        fin = _iso(get_fin(r))
+        if not fin or fin < since:
+            continue
+        sha = get_sha(r)
         res = (r.get("result") or "").lower()
-        fin = _iso(r.get("finishedDate") or r.get("finishTime"))
-        if not fin:
-            continue
         deployments.append({
-            "id": r.get("id"), "repo": pname, "pipeline": pname,
+            "id": r.get("id"), "repo": name, "pipeline": name,
             "environment": "Production", "finished_at": fin,
             "result": "failed" if res in ("failed", "canceled") else "succeeded",
-            "pr_id": None, "commit_sha": None,
+            "pr_id": pr_merge_sha.get(sha), "commit_sha": sha,
         })
-    # 失敗事件：以「失敗部署 → 下一次同管線成功部署」當作復原時間
+
     by_pipe = {}
     for d in sorted(deployments, key=lambda x: x["finished_at"]):
         by_pipe.setdefault(d["pipeline"], []).append(d)
-    for pipe, ds in by_pipe.items():
+    for ds in by_pipe.values():
         for i, d in enumerate(ds):
-            if d["result"] == "failed":
-                nxt = next((x for x in ds[i + 1:] if x["result"] == "succeeded"), None)
-                incidents.append({
-                    "id": f"INC-{d['id']}", "repo": pipe, "deployment_id": d["id"],
-                    "started_at": d["finished_at"],
-                    "resolved_at": nxt["finished_at"] if nxt else None,
-                })
+            if d["result"] != "failed":
+                continue
+            nxt = next((x for x in ds[i + 1:] if x["result"] == "succeeded"), None)
+            incidents.append({
+                "id": f"INC-{d['id']}", "repo": d["pipeline"], "deployment_id": d["id"],
+                "started_at": d["finished_at"],
+                "resolved_at": nxt["finished_at"] if nxt else None,
+            })
     return deployments, incidents

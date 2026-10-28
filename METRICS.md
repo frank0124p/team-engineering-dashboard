@@ -60,7 +60,7 @@ P  = v[⌊k⌋] + (v[⌈k⌉] - v[⌊k⌋]) × (k - ⌊k⌋)        # v 為排�
 ### 0.4 誰被算進去
 
 - **排除機器人**：作者名稱含 `bot` / `[bot]` / `dependabot` / `renovate` /
-  `azure pipelines` / `service account` 的一律剔除（清單在 `config.json` 的 `team.bot_patterns`）。
+  `azure pipelines` / `service account` 的一律剔除（清單在 `config.json` 頂層的 `bot_patterns`）。
 - **active_devs**（活躍工程師數）＝ 本期**有合併 PR 的不重複作者數**。
   沒有交付的人不計入分母 —— 休假的人不應該稀釋團隊的每人產出數字。
 
@@ -260,19 +260,28 @@ DORA 告訴你「團隊交付效能如何」，但不會告訴你「卡在哪」
 
 ---
 
-### 2.4 PR 變更行數
+### 2.4 PR 大小
 
-**意思**：一個 PR 改了多少程式碼。這是**最被低估的槓桿指標**。
+**意思**：一個 PR 改了多少東西。這是**最被低估的槓桿指標**。
 
 **算法**
 
 ```
-單一 PR 大小 = additions + deletions
+預設單位 = 變更檔案數（config.json 的 pr_size_metric: "files"）
+單一 PR 大小 = 該 PR 最後一次 iteration 的 changeEntries 去重後的檔案數
 顯示 P50、P75，以及超過健康上限的比例
-健康上限預設 400 行（config.json 的 thresholds.pr_size_healthy_lines）
+健康上限預設 10 個檔（thresholds.pr_size_healthy_files）
 ```
 
-**為什麼 200–400 行是業界共識的上限**：
+**為什麼預設用檔案數而不是行數**：Azure DevOps 的 PR API 不提供 additions/deletions，
+行數要另外把 repo clone 下來逐一 diff 才算得出來。檔案數是 API 直接給的、不會失真，
+而且和「審查者要讀多少上下文」的相關性不差。
+
+想用行數的話把 `pr_size_metric` 改成 `"lines"`，門檻走 `thresholds.pr_size_healthy_lines`（預設 400）——
+但要注意 Azure 來源的行數需要本機 clone 才有值，否則會是 0。
+介面上的單位（個檔／行）會跟著這個設定自動切換，直方圖分箱也會換一組。
+
+**為什麼 200–400 行（約 10 個檔）是業界共識的上限**：
 超過這個量，審查者的缺陷發現率會明顯掉下來 —— 人會開始滑過去而不是真的讀。
 研究一致顯示大 PR 同時造成：審查時間拉長、缺陷漏接率上升、合併衝突變多。
 
@@ -429,7 +438,7 @@ AI 協助 PR 佔比 = AI 協助 PR 數 ÷ 本期合併 PR 數 × 100%
 |---|---|---|
 | PR 數 | 組內計數 | — |
 | 週期時間（中位） | 組內 `merged_at − created_at` 的 P50 | AI 沒讓交付變快，只是寫得快 |
-| 變更行數（中位） | 組內 `additions + deletions` 的 P50 | AI 在推高 PR 體積，審查品質會受害 |
+| PR 大小（中位） | 組內變更檔案數的 P50（單位依 `pr_size_metric`） | AI 在推高 PR 體積，審查品質會受害 |
 | 審查耗時（中位） | 組內 `first_approval_at − first_review_at` 的 P50 | 審查者要花更多力氣讀 AI 寫的東西 |
 | 審查留言數（中位） | 組內 `comment_count` 的 P50 | 來回更多，可能是品質或可讀性問題 |
 | 核准後回工率 | 組內回工 PR 比例 | AI 產出比較常需要補修 |
@@ -439,7 +448,7 @@ AI 協助 PR 佔比 = AI 協助 PR 數 ÷ 本期合併 PR 數 × 100%
 
 **怎麼讀這張表**：
 - 全綠 → AI 正在真的幫忙，可以放心推廣。
-- 變更行數紅、其他綠 → 還行，但要開始要求「AI 幫你寫完要自己切小」。
+- PR 大小紅、其他綠 → 還行，但要開始要求「AI 幫你寫完要自己切小」。
 - 變更失敗率紅 → **停下來**。先查是不是 PR 太大導致審查漏接，而不是繼續加碼。
 
 頁面上的「品質護欄」那一格就是這張表的濃縮：
@@ -470,7 +479,7 @@ AI 組的變更失敗率超過人工組 2 個百分點以上，就亮紅燈。
 
 ### 5.1 成員視圖
 
-每位成員顯示：合併 PR 數、PR/週、週期時間 P50、PR 行數 P50、AI 比例、擔任審查次數、回工率。
+每位成員顯示：合併 PR 數、PR/週、週期時間 P50、PR 大小 P50、AI 比例、擔任審查次數、回工率。
 算法和團隊層級完全相同，只是把範圍縮到該作者的 PR。
 
 「可留意」欄位的觸發條件：
@@ -504,7 +513,7 @@ DORA 與 SPACE 兩個框架都明確指出這一點，理由是 **Goodhart 定�
 
 ### 5.3 Repository 視圖
 
-每個 repo 的合併 PR 數、週期時間 P50、PR 行數 P50、AI 比例。
+每個 repo 的合併 PR 數、週期時間 P50、PR 大小 P50、AI 比例。
 
 **怎麼用**：某個 repo 的週期時間或 PR 大小明顯高於其他 repo，
 通常指向該 repo 的測試覆蓋不足（不敢改，所以改動累積成大 PR）
@@ -557,22 +566,22 @@ DORA 與 SPACE 兩個框架都明確指出這一點，理由是 **Goodhart 定�
 見 [2.2](#22-週期時間四階段拆解)。四段各自取中位數，加總不等於週期時間中位數。
 那張圖是用來比較相對寬度的。
 
-### 7.3 變更失敗率需要「部署 ↔ PR」的關聯
+### 7.3 部署 ↔ PR 的關聯（已處理，但有前提）
 
 AI vs 人工的變更失敗率對照，需要知道每次部署對應哪個 PR。
-**Azure DevOps adapter 目前沒有建立這個關聯**（`deployment.pr_id` 為 `None`），
-所以接上真實資料後，對照表的「變更失敗率」那一列會是 `—`。
+Azure DevOps adapter 現在用**部署的 commit SHA 比對 PR 的 `lastMergeCommit`** 來建立這個關聯。
 
-要補的話有兩條路：用部署的 commit SHA 反查所屬 PR，或接 pipeline 的 build-to-PR 關聯 API。
+**前提**：squash merge 或 rebase 後重寫過 SHA 的 PR 對不上，那幾次部署的 `pr_id` 會是 `None`，
+不會被算進 AI／人工的失敗率分母。團隊若全面用 squash merge，這一列的樣本數會偏少，
+看的時候要留意分母。
 
-### 7.4 Azure DevOps 的 PR 變更行數目前不準
+### 7.4 PR 大小的單位是檔案數，不是行數
 
-Azure DevOps 的 iterations API 不直接回 additions / deletions，
-現在的 `_pr_size()` 只拿得到 `files_changed`，行數回 0。
+Azure DevOps 的 PR API 不給 additions/deletions，所以預設單位改成**變更檔案數**（見 [2.4](#24-pr-大小)）。
+這不是誤差，是刻意的選擇：檔案數是 API 直接給的真實值，行數在這個來源拿不到。
 
-**接上真實資料時必須先修這個**，否則「PR 變更行數」、「超標比例」、
-「分佈直方圖」、AI vs 人工的「變更行數」對照，這四處會全部失真。
-修法是逐 iteration 取 diff 並累加 changeCounts。
+**所以跨工具比較要小心** —— 別拿這裡的「10 個檔」去對 GitHub 報表的「400 行」，
+那是兩個不同的量。要行數就把 `pr_size_metric` 設成 `lines` 並自備本機 clone。
 
 ### 7.5 變更前置時間用合併時間代替上線時間
 

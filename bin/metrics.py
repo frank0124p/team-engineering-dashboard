@@ -100,14 +100,45 @@ def detect_ai(pr, cfg):
     return False, None
 
 
+def roster_of(cfg):
+    """取得（必要時建立）這次計算共用的成員名單物件。"""
+    r = cfg.get("_roster")
+    if r is None:
+        import config_loader
+        r = config_loader.Roster(cfg)
+        cfg["_roster"] = r
+    return r
+
+
+def is_tracked(x, cfg):
+    """這筆 PR 的作者在追蹤名單內嗎（名單空白時全部計入）。"""
+    return roster_of(cfg).includes(x.get("author"), x.get("author_name"))
+
+
 def is_bot(name, cfg):
-    if not cfg["team"].get("exclude_bots"):
-        return False
+    """azdo 來源已經在抓取時用團隊名單濾過了；這裡是 mock 與舊資料的保險。"""
     n = (name or "").lower()
-    return any(b in n for b in cfg["team"]["bot_patterns"])
+    return any(b in n for b in (cfg.get("bot_patterns") or []))
 
 
 # ---------- 單一期間的指標 ----------
+
+def size_of(pr, metric):
+    """PR 大小。Azure DevOps 不提供增刪行數，所以預設用變更檔案數 —— 
+    準確的小單位勝過估出來的大單位。"""
+    if metric == "lines":
+        return (pr.get("additions") or 0) + (pr.get("deletions") or 0)
+    return pr.get("files_changed") or 0
+
+
+def size_threshold(cfg, metric):
+    th = cfg["thresholds"]
+    return (th.get("pr_size_healthy_lines", 400) if metric == "lines"
+            else th.get("pr_size_healthy_files", 10))
+
+
+SIZE_UNIT = {"files": "個檔", "lines": "行"}
+
 
 def _window_prs(prs, start, end):
     """以 merge 時間落在視窗內為準（未合併的 PR 另外用 created_at 看積壓）。"""
@@ -115,8 +146,11 @@ def _window_prs(prs, start, end):
 
 
 def period(data, cfg, start, end, label):
+    metric = data.get("size_metric", cfg.get("pr_size_metric", "files"))
+    size_limit = size_threshold(cfg, metric)
     prs_all = data["pull_requests"]
-    prs = [x for x in _window_prs(prs_all, start, end) if not is_bot(x.get("author_name"), cfg)]
+    prs = [x for x in _window_prs(prs_all, start, end)
+           if not is_bot(x.get("author_name"), cfg) and is_tracked(x, cfg)]
     deps = [d for d in data["deployments"] if start <= dt(d["finished_at"]) < end]
     incs = [i for i in data["incidents"] if start <= dt(i["started_at"]) < end]
     days = max(1, (end - start).days)
@@ -130,7 +164,7 @@ def period(data, cfg, start, end, label):
         x["_idle"] = hours(x.get("first_approval_at"), x.get("merged_at"))
         x["_cycle"] = hours(x.get("created_at"), x.get("merged_at"))
         x["_lead"] = hours(x.get("first_commit_at"), x.get("merged_at"))
-        x["_size"] = (x.get("additions", 0) or 0) + (x.get("deletions", 0) or 0)
+        x["_size"] = size_of(x, metric)
 
     authors = {x["author"] for x in prs}
     devs = max(1, len(authors))
@@ -160,10 +194,20 @@ def period(data, cfg, start, end, label):
 
     # ---- 流程 / Speed ----
     reviewed = [x for x in prs if x.get("first_review_at")]
-    stale = [x for x in prs_all
-             if x.get("status") == "active" and x.get("created_at")
-             and dt(x["created_at"]) < end
-             and hours(x["created_at"], end.isoformat()) > th["stale_pr_days"] * 24]
+    def _is_stale(x):
+        if x.get("status") != "active" or not x.get("created_at"):
+            return False
+        if dt(x["created_at"]) >= end:
+            return False
+        if hours(x["created_at"], end.isoformat()) <= th["stale_pr_days"] * 24:
+            return False
+        if is_bot(x.get("author_name"), cfg):
+            return False
+        # 積壓清單也要只看追蹤名單內的人，不然會看到別組的 PR
+        r = roster_of(cfg)
+        return (not r.enabled) or r.match(x.get("author"), x.get("author_name")) is not None
+
+    stale = [x for x in prs_all if _is_stale(x)]
     sizes = [x["_size"] for x in prs]
     reviewer_load = Counter()
     for x in prs:
@@ -185,7 +229,7 @@ def period(data, cfg, start, end, label):
         },
         "pr_size_p50": p(sizes, 0.5),
         "pr_size_p75": p(sizes, 0.75),
-        "pr_oversize_pct": pct(len([s for s in sizes if s > th["pr_size_healthy_lines"]]), len(sizes)),
+        "pr_oversize_pct": pct(len([s for s in sizes if s > size_limit]), len(sizes)),
         "review_coverage_pct": pct(len(reviewed), len(prs)),
         "rework_rate_pct": pct(len([x for x in prs if x.get("pushes_after_approval", 0) > 0]), len(prs)),
         "stale_pr_count": len(stale),
@@ -194,7 +238,10 @@ def period(data, cfg, start, end, label):
               "age_days": round(hours(x["created_at"], end.isoformat()) / 24, 1)} for x in stale],
             key=lambda z: -z["age_days"])[:10],
         "reviewer_concentration_pct": pct(top2, sum(reviewer_load.values())),
-        "size_histogram": _histogram(sizes),
+        "size_histogram": _histogram(sizes, metric),
+        "size_metric": metric,
+        "size_unit": SIZE_UNIT.get(metric, ""),
+        "size_limit": size_limit,
     }
 
     # ---- Impact（工作類型配比）----
@@ -250,7 +297,7 @@ def period(data, cfg, start, end, label):
             "ai_pct": pct(len(a), len(items)),
             "reviews_given": reviewer_load.get(uid, 0),
             "rework_pct": pct(len([x for x in items if x.get("pushes_after_approval", 0) > 0]), len(items)),
-            "oversize_pct": pct(len([x for x in items if x["_size"] > th["pr_size_healthy_lines"]]), len(items)),
+            "oversize_pct": pct(len([x for x in items if x["_size"] > size_limit]), len(items)),
         })
     people.sort(key=lambda z: -z["pr_merged"])
 
@@ -270,9 +317,13 @@ def period(data, cfg, start, end, label):
             "dora": dora, "flow": flow, "ai": ai, "people": people, "repos": repos}
 
 
-def _histogram(sizes):
-    bins = [(0, 50, "≤50"), (50, 100, "51–100"), (100, 200, "101–200"),
-            (200, 400, "201–400"), (400, 800, "401–800"), (800, 10**9, ">800")]
+def _histogram(sizes, metric="files"):
+    if metric == "lines":
+        bins = [(0, 50, "≤50"), (50, 100, "51–100"), (100, 200, "101–200"),
+                (200, 400, "201–400"), (400, 800, "401–800"), (800, 10**9, ">800")]
+    else:
+        bins = [(0, 2, "1–2"), (2, 5, "3–5"), (5, 10, "6–10"),
+                (10, 20, "11–20"), (20, 40, "21–40"), (40, 10**9, ">40")]
     out = []
     for lo, hi, lbl in bins:
         out.append({"label": lbl, "count": len([s for s in sizes if lo < s <= hi] if lo else [s for s in sizes if s <= hi])})
@@ -286,7 +337,7 @@ def weekly_trend(data, cfg, end, n_weeks=8):
         w_end = end - timedelta(days=7 * i)
         w_start = w_end - timedelta(days=7)
         prs = [x for x in _window_prs(data["pull_requests"], w_start, w_end)
-               if not is_bot(x.get("author_name"), cfg)]
+               if not is_bot(x.get("author_name"), cfg) and is_tracked(x, cfg)]
         for x in prs:
             x["_ai"], _ = detect_ai(x, cfg)
         ai_n = len([x for x in prs if x["_ai"]])
@@ -328,6 +379,7 @@ def compute(data, cfg):
             "team": cfg["team"]["name"],
             "window_days": wd,
             "thresholds": cfg["thresholds"],
+            "roster_report": roster_of(cfg).report(),
         },
         "current": cur,
         "baseline": base,
@@ -350,8 +402,8 @@ def alerts(m):
     flow, ai, dora = c["flow"], c["ai"], c["dora"]
     out = []
     if flow["pr_oversize_pct"] > 30:
-        out.append(("PR 偏大", f'{flow["pr_oversize_pct"]}% 的 PR 超過 {th["pr_size_healthy_lines"]} 行，'
-                               f'大 PR 同時拖慢審查並推高失敗率'))
+        out.append(("PR 偏大", f'{flow["pr_oversize_pct"]}% 的 PR 超過 {flow["size_limit"]}'
+                               f'{flow["size_unit"]}，大 PR 同時拖慢審查並推高失敗率'))
     if flow["breakdown"]["pickup"] > th["pickup_time_target_hours"]:
         out.append(("等待審查過長", f'PR 平均要等 {flow["breakdown"]["pickup"]:.1f} 小時才有人看，'
                                  f'目標是 {th["pickup_time_target_hours"]} 小時內'))
@@ -366,7 +418,8 @@ def alerts(m):
     a, h = ai.get("ai"), ai.get("human")
     if a and h and a["cfr"] is not None and h["cfr"] is not None and a["cfr"] > h["cfr"] + 2:
         out.append(("AI PR 品質警訊", f'AI 協助 PR 的變更失敗率 {a["cfr"]}%，高於人工 PR 的 {h["cfr"]}%；'
-                                  f'先看 PR 大小（{a["size_p50"]} vs {h["size_p50"]} 行）與審查深度'))
+                                  f'先看 PR 大小（{a["size_p50"]} vs {h["size_p50"]}'
+                                  f'{flow["size_unit"]}）與審查深度'))
     for key, label in (("change_failure_rate", "變更失敗率"), ("lead_time", "變更前置時間")):
         if dora["ratings"][key] in ("Medium", "Low"):
             out.append((f"DORA {label}落在 {dora['ratings'][key]}", "離 Elite 還有距離，值得排進改善項目"))

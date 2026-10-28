@@ -1,147 +1,158 @@
 # 團隊工程產出儀表板（AI 時代）
 
-每日監控團隊在 PR / commit / 部署上的產出，並把「AI 協助產出」當成第一級指標追蹤。
+追蹤團隊在 PR／commit／部署上的產出，把「AI 協助產出」當成第一級指標。
 指標對齊 DORA、SPACE、DX Core 4 與 DX AI Measurement Framework。
 
-目前跑在**示範資料**上（雛形），接上公司 Azure DevOps 只需改一個設定。
+> **📐 每個指標的定義、公式與已知誤差寫在 [METRICS.md](METRICS.md)。**
+> 要解讀數字、或動任何指標之前，先讀那一份。
 
-> **📐 每個指標的定義、計算公式與已知誤差，完整寫在 [METRICS.md](METRICS.md)。**
-> 要解讀數字、或動任何指標之前，先讀那份。
+**設計目標：搬到任何一台機器，只要兩件事就能跑 —— PAT 與要追蹤的成員名單。**
+組織、專案、repo 清單都用 PAT 自動偵測；沒有 PAT 就跑示範資料，介面照樣完整。
 
-```
-team-dashboard/
-├── config.json              ← 唯一要改的檔案
-├── bin/
-│   ├── dashboard.py         ← 進入點
-│   ├── metrics.py           ← 指標計算（DORA / DX Core 4 / AI 框架）
-│   ├── render.py            ← SVG 圖表元件
-│   ├── page.py              ← 頁面組裝
-│   └── sources/
-│       ├── mock_source.py   ← 示範資料產生器
-│       └── azdo_source.py   ← Azure DevOps REST adapter
-└── out/
-    ├── team-dashboard.html  ← 本機打開就能看
-    ├── artifact-body.html   ← 發佈成線上 Artifact 用的片段
-    └── metrics.json         ← 所有指標的原始數值
-```
+---
 
-## 用法
+## 三步上手
+
+### 1. 申請 PAT（唯讀）
+
+Azure DevOps → 右上頭像 → **Personal access tokens** → New Token：
+
+| Scope | 用途 | 必要性 |
+|---|---|---|
+| **Code (Read)** | repo、PR、commit、iteration | 必要 |
+| **Build (Read)** | 建置／部署紀錄 | 必要（DORA 要用） |
+| **Release (Read)** | 走 Classic Release 的話 | 視環境 |
+| **Work Items (Read)** | 工作類型配比 | 可選 |
+
+### 2. 跑引導設定
 
 ```bash
-cd ~/Claude/team-dashboard
-/usr/bin/python3 bin/dashboard.py                 # 產生 HTML + JSON
-/usr/bin/python3 bin/dashboard.py --summary       # 純文字摘要（丟 Discord 用）
-/usr/bin/python3 bin/dashboard.py --window 14     # 改成看 14 天
-/usr/bin/python3 bin/dashboard.py --source azdo   # 強制走 Azure DevOps
+/usr/bin/python3 bin/setup.py
+```
+
+它會：貼上 PAT → 驗證身分 → 自動列出你有權限的組織／專案／repo（只有一個就直接用）→
+問要追蹤哪些成員 → 把設定寫進 `config.local.json`（已被 .gitignore 排除）。
+PAT 存進 macOS Keychain；非 macOS 或存取失敗時寫入 `.env` 並 `chmod 600`。
+
+不想互動也可以全部用環境變數（CI／容器適用）：
+
+```bash
+export AZDO_PAT='<PAT>'
+export TD_MEMBERS='Amy Chen, ben.liu@corp.com, carol.wu'
+export TD_ORG='my-org'          # 可省略，會自動偵測
+export TD_PROJECT='my-project'  # 可省略
+```
+
+### 3. 跑
+
+```bash
+/usr/bin/python3 bin/dashboard.py --check      # 檢查設定與連線，列出缺什麼
+/usr/bin/python3 bin/dashboard.py --summary    # 純文字摘要，可直接貼 Discord/Slack
+/usr/bin/python3 bin/dashboard.py              # 產 HTML + JSON
 open out/team-dashboard.html
 ```
 
-## 接上公司 Azure DevOps
+---
 
-### 1. 申請 PAT（唯讀即可）
+## 設定從哪裡來
 
-Azure DevOps → 右上頭像 → **Personal access tokens** → New Token，勾這些 scope：
+後面的覆蓋前面的，所以公司機器只要動第 2、3 層：
 
-| Scope | 用途 |
-|---|---|
-| **Code (Read)** | repo、PR、commit、iteration |
-| **Build (Read)** | 建置/部署紀錄 |
-| **Release (Read)** | 走 Classic Release 的話需要 |
-| **Work Items (Read)** | 工作類型配比（Impact 面向），可選 |
+| 層 | 位置 | 放什麼 | 進 git？ |
+|---|---|---|---|
+| 1 | `config.json` | 預設值、門檻、AI 偵測規則 | ✅ 會 |
+| 2 | `config.local.json` | 你的組織／專案／成員名單 | ❌ 已排除 |
+| 3 | 環境變數 `TD_*`、`AZDO_PAT` | CI／容器 | ❌ |
+| 4 | 命令列 `--members/--org/--project/--window` | 臨時試一下 | ❌ |
 
-存進 Keychain（不要寫進檔案）：
+PAT 的來源依序是：環境變數 → `.env` → macOS Keychain。
+**任何一層都不會把 PAT 寫進會進 git 的檔案。**
 
-```bash
-security add-generic-password -s azdo-pat -a "$USER" -w '<貼上 PAT>'
-```
+---
 
-### 2. 改 config.json
+## 成員名單怎麼寫
+
+email、帳號、顯示名混著寫都認得（正規化後比對，大小寫、空白、點、底線都不影響）：
 
 ```json
-{
-  "source": "azdo",
-  "azdo": {
-    "organization": "你的組織名",
-    "project": "你的專案名",
-    "repos": [],                       // 空陣列 = 該專案下全部 repo
-    "deployment_pipelines": ["xxx-release"],   // 空陣列 = 全部 pipeline
-    "production_environments": ["Production"]
-  }
+"team": {
+  "name": "Platform Team",
+  "members": ["Amy Chen", "ben.liu@corp.com", "carol.wu"],
+  "members_mode": "include"
 }
 ```
 
-### 3. 驗證
+- **名單有填** → 所有指標、個人區塊、積壓 PR 清單都只算名單內的人
+- **名單留空** → 計入專案內所有人（機器人仍會排除，清單在 `config.json` 頂層 `bot_patterns`）
+- **名字打錯會講出來**：名單裡有人整段期間零 PR，摘要與 HTML 都會點名提醒 ——
+  這是實務上最常見的坑（換帳號、改英文名、拼錯）
+- **名單外出現的人也會列出**，方便你決定要不要納入
+
+臨時只看某幾個人不必改檔：
 
 ```bash
-/usr/bin/python3 bin/dashboard.py --source azdo --summary
+/usr/bin/python3 bin/dashboard.py --summary --members "Amy Chen, ben.liu"
 ```
 
-### 4.（可選）裝 Azure DevOps MCP，讓我能互動查詢
+---
 
-本機目前沒有這個 MCP。要加的話：
+## 指令
 
 ```bash
-claude mcp add azure-devops -s user -- npx -y @azure-devops/mcp <你的組織名>
+bin/dashboard.py --check             # 設定與連線體檢（搬機器後第一件事）
+bin/dashboard.py --summary           # 純文字摘要
+bin/dashboard.py --window 7          # 改觀測窗天數
+bin/dashboard.py --source demo       # 強制跑示範資料（給簡報／試版面用）
+bin/dashboard.py --source azdo       # 強制走 Azure DevOps
+bin/dashboard.py --artifact          # 另產 out/artifact-body.html（發佈線上版用）
+bin/setup.py                         # 互動設定
+bash bin/daily.sh                    # 重建 + 印摘要（排程用）
 ```
 
-裝好後我可以直接問「這週誰的 PR 卡最久」而不用重跑整個管線。
-儀表板本身不依賴 MCP（走 REST），所以排程照跑，兩條路互補。
+`--source` 預設是 `auto`：拿得到 PAT 就連 Azure DevOps，拿不到就跑示範資料並在輸出標明。
 
-## 排程（每日自動更新）
+---
 
-接上真實資料後，加到既有的 cron / launchd：
+## 產物
 
-```bash
-cd ~/Claude/team-dashboard && /usr/bin/python3 bin/dashboard.py --summary
+| 檔案 | 用途 |
+|---|---|
+| `out/team-dashboard.html` | 本機打開就能看，單一檔案、無外部依賴 |
+| `out/metrics.json` | 所有指標的原始數值，要自己加工就讀這支 |
+| `out/artifact-body.html` | 發佈成線上版用的 body 片段 |
+
+---
+
+## 搬到公司環境的注意事項
+
+- **只依賴 Python 標準庫**，不需要 pip install。`/usr/bin/python3`（3.9+）就能跑。
+- **不綁 macOS**：Keychain 只是 PAT 的其中一個選項，Windows／Linux 走環境變數或 `.env`。
+- **全部唯讀**：只呼叫 GET，不會對公司 repo 或 pipeline 做任何寫入。
+- **PR 大小的單位是「變更檔案數」**，不是行數 —— Azure DevOps 的 PR API 不給行數。
+  詳情與取捨見 METRICS.md 的 [2.4](METRICS.md#24-pr-大小)。
+- **指標不拆到個人績效**：個人區塊存在的目的是找「誰被卡住、誰的審查負載過重」，
+  METRICS.md 第 6 節寫明了哪些用法會把這份儀表板變成反效果，上線前請團隊一起讀那一節。
+
+---
+
+## 檔案結構
+
 ```
-
-把 stdout 丟進 Discord 就是每日工程早報；HTML 則留著給週會點開看細節。
-
-## 指標清單（詳細定義見 [METRICS.md](METRICS.md)）
-
-### DORA 四大指標（交付效能，團隊層級）
-部署頻率、變更前置時間、變更失敗率、失敗復原時間。
-分級門檻（Elite / High / Medium / Low）直接套 DORA State of DevOps 報告的定義。
-
-### 流程指標（PR 健康度）
-- **PR 週期時間**，拆成 撰寫 → 等待審查 → 審查中 → 待合併 四段。
-  等待審查（pickup time）通常是最大的浪費來源。
-- **PR 變更行數** 中位數與超標比例（業界健康上限 200–400 行）
-- **審查覆蓋率**、**核准後回工率**、**審查集中度**（bus factor）、**積壓 PR**
-
-### DX Core 4
-Speed（吞吐與週期）、Quality（失敗率、回工率、PR 大小）、Impact（工作類型配比）。
-Effectiveness 面向需要開發者體驗問卷（DXI），本工具不涵蓋。
-
-### AI 指標（DX AI Measurement Framework）
-- **採用率**：期間內至少交付一個 AI 協助 PR 的工程師佔比
-- **AI 協助 PR 佔比**
-- **AI vs 人工 對照**：週期時間、PR 大小、審查耗時、留言數、回工率、變更失敗率
-
-AI 辨識方式：掃 commit message 的 `Co-Authored-By:` trailer
-（Claude Code / Copilot / Cursor / Codex / Gemini），輔以 `ai-assisted` PR 標籤。
-規則寫在 `config.json` 的 `ai_detection.trailers`，可自行增減。
-
-> **已知限制**：工程師若手動刪掉 trailer，或直接在編輯器裡接受補全而不留痕跡，
-> 這類 AI 使用抓不到，採用率會被低估。要拿精確數字得靠 IDE 遙測或問卷補。
-
-## 使用守則（重要）
-
-個人層級的數字**不可**當績效考核。DORA 與 SPACE 框架都指出，個人產出指標一旦變成 KPI，
-就會被最佳化成「切小 PR、灌數量」而失去訊號（Goodhart 定律）。
-
-成員視圖的設計用途是：
-- 找出**週期時間特別長**的人 → 去問「你卡在哪」
-- 找出**審查負載過度集中**的人 → 分擔出去
-- 找出**完全沒參與審查**的人 → 把他拉進來
-
-所以每一列都同時列出吞吐欄位與護欄欄位，不提供排序排名。
-
-
-## Claude Code Skill
-
-本機已安裝 skill，在 Claude Code 裡直接輸入 `/team-dashboard` 即可叫用。
-Skill 定義在 `~/.claude/skills/team-dashboard/SKILL.md`（不在本 repo 內，因為它是本機工具設定）。
-
-它知道怎麼跑這些指令、怎麼接 Azure DevOps、以及三條不可違反的報數字規則：
-個人指標不做排名、AI 採用率必須標註低估、吞吐指標不可單獨報。
+team-dashboard/
+├── config.json              預設值（進 git，不含機密與公司資訊）
+├── config.local.json        你的設定（setup.py 產生，已 gitignore）
+├── .env                     PAT（可選，已 gitignore）
+├── bin/
+│   ├── setup.py             互動設定精靈
+│   ├── dashboard.py         進入點
+│   ├── config_loader.py     設定分層載入 + 成員名單比對
+│   ├── azdo_client.py       Azure DevOps HTTP 層 + 組織/專案自動偵測
+│   ├── metrics.py           指標計算（DORA / DX Core 4 / AI 框架）
+│   ├── page.py              HTML 組裝
+│   ├── render.py            SVG 圖表元件
+│   └── sources/
+│       ├── azdo_source.py   Azure DevOps → 正規化資料
+│       └── mock_source.py   示範資料產生器
+├── METRICS.md               指標定義與已知誤差
+└── out/                     產物（gitignore）
+```
